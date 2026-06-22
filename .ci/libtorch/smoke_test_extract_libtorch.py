@@ -89,7 +89,9 @@ class TestSmokeExtraction(unittest.TestCase):
     def test_metadata_content(self):
         zip_path = self._extract()
         with zipfile.ZipFile(zip_path) as zf:
-            self.assertEqual(zf.read("libtorch/build-version").decode().strip(), "2.6.0")
+            self.assertEqual(
+                zf.read("libtorch/build-version").decode().strip(), "2.6.0"
+            )
             self.assertEqual(zf.read("libtorch/build-hash").decode().strip(), "abc123")
 
     def test_latest_symlink_created(self):
@@ -99,9 +101,18 @@ class TestSmokeExtraction(unittest.TestCase):
         self.assertTrue(symlinks[0].is_symlink())
 
     def test_zip_prefix_naming(self):
-        self.assertEqual(compute_zip_prefix("linux", "cu126", "shared-with-deps"), "libtorch-shared-with-deps")
-        self.assertEqual(compute_zip_prefix("macos", "cpu", "shared-with-deps"), "libtorch-macos-arm64")
-        self.assertEqual(compute_zip_prefix("windows", "cu126", "shared-with-deps"), "libtorch-win-shared-with-deps")
+        self.assertEqual(
+            compute_zip_prefix("linux", "cu126", "shared-with-deps"),
+            "libtorch-shared-with-deps",
+        )
+        self.assertEqual(
+            compute_zip_prefix("macos", "cpu", "shared-with-deps"),
+            "libtorch-macos-arm64",
+        )
+        self.assertEqual(
+            compute_zip_prefix("windows", "cu126", "shared-with-deps"),
+            "libtorch-win-shared-with-deps",
+        )
 
     def test_find_wheel_errors(self):
         empty = Path(self._tmp) / "empty"
