@@ -166,6 +166,7 @@ if is_available():
     if sys.platform != "win32":
         from torch._C._distributed_c10d import HashStore
 
+    from . import watchdog
     from .device_mesh import DeviceMesh, init_device_mesh
 
     # Variables prefixed with underscore are not auto imported

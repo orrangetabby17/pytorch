@@ -1,5 +1,6 @@
 #include <torch/csrc/python_headers.h>
 
+#include <ATen/DeviceAccelerator.h>
 #include <c10/util/intrusive_ptr.h>
 #include <torch/csrc/distributed/c10d/FileStore.hpp>
 #include <torch/csrc/distributed/c10d/FlightRecorder.hpp>
@@ -10,6 +11,7 @@
 #include <torch/csrc/distributed/c10d/control_collectives/ControlCollectives.hpp>
 #include <torch/csrc/distributed/c10d/control_collectives/StoreCollectives.hpp>
 #include <torch/csrc/distributed/c10d/control_plane/WorkerServer.hpp>
+#include <torch/csrc/distributed/c10d/watchdog/Watchdog.hpp>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -71,6 +73,53 @@
 #include <torch/custom_class.h>
 
 namespace {
+
+// Wraps a Python callable as a watchdog Callback. The callback is both invoked
+// and destroyed while holding the GIL, since it may run or be dropped on the
+// watchdog's loop thread. A null/None callable maps to an empty Callback.
+::c10d::watchdog::Callback wrapWatchdogCallback(py::object fn) {
+  if (fn.is_none()) {
+    return nullptr;
+  }
+  auto holder = std::shared_ptr<py::object>(
+      new py::object(std::move(fn)), [](py::object* p) {
+        py::gil_scoped_acquire gil;
+        delete p;
+      });
+  return [holder]() {
+    py::gil_scoped_acquire gil;
+    try {
+      (*holder)();
+    } catch (py::error_already_set& e) {
+      e.discard_as_unraisable("torch.distributed.watchdog callback");
+    } catch (const std::exception& e) {
+      TORCH_WARN("torch.distributed.watchdog callback raised: ", e.what());
+    }
+  };
+}
+
+// Context manager guard for a CPU blocking timeout. Arms a timer on __enter__
+// and cancels it on __exit__, so the callback only fires if the guarded section
+// runs longer than the timeout.
+struct WatchdogTimeoutGuard {
+  std::shared_ptr<::c10d::watchdog::Watchdog> watchdog;
+  std::chrono::milliseconds timeout{};
+  py::object callback;
+  uint64_t timerId{0};
+  bool armed{false};
+};
+
+// Context manager guard for an accelerator stream timeout. Records a start
+// event on __enter__ and an end event on __exit__, then hands both to the
+// watchdog.
+struct WatchdogStreamTimeoutGuard {
+  std::shared_ptr<::c10d::watchdog::Watchdog> watchdog;
+  std::chrono::milliseconds timeout{};
+  py::object startedCallback;
+  py::object timedoutCallback;
+  std::optional<c10::Event> startEvent;
+  std::optional<c10::Stream> stream;
+};
 
 #ifdef USE_C10D_NCCL
 
@@ -4840,6 +4889,109 @@ such as `dist.all_reduce(tensor, async_op=True)`.
           "set_status",
           &::c10d::control_plane::Response::setStatus,
           py::arg("status"));
+
+  py::class_<WatchdogTimeoutGuard, std::shared_ptr<WatchdogTimeoutGuard>>(
+      module, "_WatchdogTimeoutGuard")
+      .def(
+          "__enter__",
+          [](const std::shared_ptr<WatchdogTimeoutGuard>& self) {
+            self->timerId = self->watchdog->registerTimer(
+                self->timeout, wrapWatchdogCallback(self->callback));
+            self->armed = true;
+          })
+      .def(
+          "__exit__",
+          [](const std::shared_ptr<WatchdogTimeoutGuard>& self,
+             const py::args&) {
+            if (self->armed) {
+              self->watchdog->cancelTimer(self->timerId);
+              self->armed = false;
+            }
+          });
+
+  py::class_<
+      WatchdogStreamTimeoutGuard,
+      std::shared_ptr<WatchdogStreamTimeoutGuard>>(
+      module, "_WatchdogStreamTimeoutGuard")
+      .def(
+          "__enter__",
+          [](const std::shared_ptr<WatchdogStreamTimeoutGuard>& self) {
+            auto deviceType = at::accelerator::getAccelerator(true).value();
+            auto stream = at::accelerator::getCurrentStream(
+                at::accelerator::getDeviceIndex());
+            c10::Event start(deviceType);
+            start.record(stream);
+            self->stream = stream;
+            self->startEvent = std::move(start);
+          })
+      .def(
+          "__exit__",
+          [](const std::shared_ptr<WatchdogStreamTimeoutGuard>& self,
+             const py::args&) {
+            TORCH_CHECK(
+                self->startEvent.has_value(),
+                "watchdog stream timeout guard exited without being entered");
+            c10::Event end(self->stream->device_type());
+            end.record(*self->stream);
+            self->watchdog->registerStreamTimeout(
+                std::move(*self->startEvent),
+                std::move(end),
+                self->timeout,
+                wrapWatchdogCallback(self->startedCallback),
+                wrapWatchdogCallback(self->timedoutCallback));
+            self->startEvent.reset();
+          });
+
+  py::class_<
+      ::c10d::watchdog::Watchdog,
+      std::shared_ptr<::c10d::watchdog::Watchdog>>(
+      module,
+      "_Watchdog",
+      R"(
+A libuv-backed timer service for CPU and accelerator stream timeouts. Use
+``_singleton()`` for the process-wide instance; construct ``_Watchdog()``
+directly for an isolated instance (useful in tests).
+)")
+      .def(py::init(
+          []() { return std::make_shared<::c10d::watchdog::Watchdog>(); }))
+      .def_static(
+          "_singleton",
+          []() { return ::c10d::watchdog::Watchdog::singleton(); })
+      .def_static("available", []() { return ::c10d::watchdog::isAvailable(); })
+      .def(
+          "context_timeout",
+          [](const std::shared_ptr<::c10d::watchdog::Watchdog>& self,
+             py::object callback,
+             std::chrono::milliseconds timeout) {
+            auto guard = std::make_shared<WatchdogTimeoutGuard>();
+            guard->watchdog = self;
+            guard->timeout = timeout;
+            guard->callback = std::move(callback);
+            return guard;
+          },
+          py::arg("callback"),
+          py::arg("timeout"))
+      .def(
+          "stream_timeout",
+          [](const std::shared_ptr<::c10d::watchdog::Watchdog>& self,
+             std::chrono::milliseconds timeout,
+             py::object started_callback,
+             py::object timedout_callback) {
+            auto guard = std::make_shared<WatchdogStreamTimeoutGuard>();
+            guard->watchdog = self;
+            guard->timeout = timeout;
+            guard->startedCallback = std::move(started_callback);
+            guard->timedoutCallback = std::move(timedout_callback);
+            return guard;
+          },
+          py::arg("timeout"),
+          py::arg("started_callback") = py::none(),
+          py::arg("timedout_callback") = py::none())
+      .def(
+          "num_active_stream_timeouts",
+          [](const std::shared_ptr<::c10d::watchdog::Watchdog>& self) {
+            return self->numActiveStreamTimeouts();
+          });
 
   Py_RETURN_TRUE;
 }
