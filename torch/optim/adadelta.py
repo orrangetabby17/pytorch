@@ -249,10 +249,10 @@ def _single_tensor_adadelta(
     acc_deltas: list[Tensor],
     state_steps: list[Tensor],
     *,
-    lr: float,
+    lr: float | Tensor,
     rho: float,
     eps: float,
-    weight_decay: float,
+    weight_decay: float | int,
     maximize: bool,
     differentiable: bool,
     capturable: bool,
@@ -299,7 +299,7 @@ def _single_tensor_adadelta(
 
         if torch.is_complex(param):
             delta = torch.view_as_complex(delta)
-        param.add_(delta, alpha=-lr)
+        param.add_(delta, alpha=-lr)  # type: ignore[arg-type]
 
 
 def _multi_tensor_adadelta(
@@ -309,10 +309,10 @@ def _multi_tensor_adadelta(
     acc_deltas: list[Tensor],
     state_steps: list[Tensor],
     *,
-    lr: float,
+    lr: float | Tensor,
     rho: float,
     eps: float,
-    weight_decay: float,
+    weight_decay: float | int,
     maximize: bool,
     differentiable: bool,
     capturable: bool,
@@ -422,10 +422,10 @@ def adadelta(
     differentiable: bool = False,
     has_complex: bool = False,
     *,
-    lr: float,
+    lr: float | Tensor,
     rho: float,
     eps: float,
-    weight_decay: float,
+    weight_decay: float | int,
     maximize: bool,
 ) -> None:
     r"""Functional API that performs Adadelta algorithm computation.
