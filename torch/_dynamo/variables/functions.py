@@ -2865,7 +2865,10 @@ class CollectiveFunctionRewriteVariable(UserFunctionVariable):
 
                 ops.append(op_var)
                 tensors.append(item.var_getattr(tx, "tensor"))
-                peers.append(item.var_getattr(tx, "peer"))
+                # P2POp.peer is a global rank, but batch_p2p_ops (like the eager
+                # ProcessGroup send/recv path) expects a group-local rank; use
+                # P2POp.group_peer so sub-group P2P resolves correctly.
+                peers.append(item.var_getattr(tx, "group_peer"))
                 tags.append(item.var_getattr(tx, "tag"))
                 if group_var is None:
                     group_var = item.var_getattr(tx, "group")
