@@ -2415,6 +2415,11 @@ if HAS_CUDA_AND_TRITON:
         @torch._inductor.config.patch("triton.cudagraph_trees_history_recording", True)
         @blas_library_context("cublas")
         @unittest.mock.patch.dict(os.environ, {"TORCH_DISABLE_ADDR2LINE": "0"})
+        @unittest.skipUnless(
+            torch.version.hip is not None
+            or os.environ.get("TORCH_CUBLAS_WORKSPACE_CACHE") == "1",
+            "persistent BLAS workspace caching is disabled",
+        )
         def test_workspace_allocation_error(self):
             torch._C._cuda_clearCublasWorkspaces()
 
@@ -2445,11 +2450,11 @@ if HAS_CUDA_AND_TRITON:
                             or "at::cuda::blas::bgemm_internal_cublaslt<float, float>"
                             in str(e)
                         )
-                        # CUDA uses getCurrentCUDABlasHandle/getNewWorkspace,
-                        # ROCm uses getNewCUDABlasLtWorkspace/getCUDABlasLtWorkspace
+                        # CUDA and ROCm allocate BLAS workspaces through the
+                        # shared allocation helper.
                         self.assertTrue(
                             "getCurrentCUDABlasHandle" in str(e)
-                            or "getNewWorkspace" in str(e)
+                            or "allocateCUDABlasWorkspace" in str(e)
                             or "CUDABlasLtWorkspace" in str(e)
                         )
 
@@ -5130,16 +5135,18 @@ if HAS_CUDA_AND_TRITON:
         @torch._inductor.config.patch("graph_partition", True)
         def test_graph_partition_no_partition_keeps_static(self):
             # When graph_partition is enabled but the forward has no unsafe
-            # ops, forward_is_partitioned should be False and all saved
+            # ops, forward_is_cudagraph_partitioned should be False and all saved
             # tensors remain static in the backward.
             from unittest.mock import patch
 
-            forward_partitioned = None
+            forward_cudagraph_partitioned = None
             orig_bw = torch._inductor.compile_fx.compile_fx_backward
 
             def intercept_bw(gm, example_inputs, compiler_config_extra, **kwargs):
-                nonlocal forward_partitioned
-                forward_partitioned = compiler_config_extra.forward_is_partitioned.value
+                nonlocal forward_cudagraph_partitioned
+                forward_cudagraph_partitioned = (
+                    compiler_config_extra.forward_is_cudagraph_partitioned.value
+                )
                 return orig_bw(gm, example_inputs, compiler_config_extra, **kwargs)
 
             class Mod(torch.nn.Module):
@@ -5163,7 +5170,7 @@ if HAS_CUDA_AND_TRITON:
                 loss.backward()
                 optimizer.step()
 
-            self.assertFalse(forward_partitioned)
+            self.assertFalse(forward_cudagraph_partitioned)
 
         @torch._inductor.config.patch("graph_partition", True)
         def test_graph_partition_cpu_only(self):
