@@ -3,7 +3,6 @@
 #include <c10/xpu/XPUCachingAllocator.h>
 
 #include <deque>
-#include <functional>
 #include <mutex>
 #include <set>
 #include <thread>
@@ -107,19 +106,23 @@ struct Block {
 
 bool BlockComparatorSize::operator()(const Block* a, const Block* b) const {
   if (a->queue != b->queue) {
-    return std::less<>{}(a->queue, b->queue);
+    return reinterpret_cast<uintptr_t>(a->queue) <
+        reinterpret_cast<uintptr_t>(b->queue);
   }
   if (a->size != b->size) {
     return a->size < b->size;
   }
-  return std::less<>{}(a->ptr, b->ptr);
+  return reinterpret_cast<uintptr_t>(a->ptr) <
+      reinterpret_cast<uintptr_t>(b->ptr);
 }
 
 bool BlockComparatorAddress::operator()(const Block* a, const Block* b) const {
   if (a->queue != b->queue) {
-    return std::less<>{}(a->queue, b->queue);
+    return reinterpret_cast<uintptr_t>(a->queue) <
+        reinterpret_cast<uintptr_t>(b->queue);
   }
-  return std::less<>{}(a->ptr, b->ptr);
+  return reinterpret_cast<uintptr_t>(a->ptr) <
+      reinterpret_cast<uintptr_t>(b->ptr);
 }
 
 // Represents a contiguous virtual memory segment mapped for allocation.
@@ -158,8 +161,9 @@ struct ExpandableSegment {
         ") must be a multiple of the device memory granularity (",
         min_granularity,
         ")");
-    max_handles_ = numSegments(static_cast<size_t>(
-        static_cast<float>(device_total) * kVirtualMemOversubscriptFactor));
+    max_handles_ = numSegments(
+        static_cast<size_t>(
+            static_cast<float>(device_total) * kVirtualMemOversubscriptFactor));
     ptr_ = sycl::ext::oneapi::experimental::reserve_virtual_mem(
         segment_size_ * max_handles_, xpu::get_device_context());
     TORCH_CHECK(
@@ -1512,6 +1516,30 @@ class DeviceCachingAllocator {
            (try_mempool_fallback(params, size, &queue, device, alloc_size) ||
             (release_cached_blocks(context, {0, 0}) &&
              alloc_block(params, true, context))));
+      // Workaround: proactively release cached blocks when reserved exceeds 80%
+      // of device total to prevent over-subscribing into host memory.
+      auto reserved_current =
+          stats.reserved_bytes[static_cast<size_t>(StatType::AGGREGATE)]
+              .current;
+      const auto& raw_device = c10::xpu::get_raw_device(device);
+      auto device_total =
+          raw_device.get_info<sycl::info::device::global_mem_size>();
+      if (C10_LIKELY(!is_capture_context()) &&
+          reserved_current + alloc_size > device_total * 4 / 5) {
+        release_cached_blocks(context, {0, 0});
+        // Retry from pool after releasing
+        block_found = get_free_block(params);
+      }
+      if (!block_found) {
+        block_found = alloc_block(params, false, context) ||
+            // Skip mempool fallback and cache release during graph capture:
+            // these operations may free memory whose address is baked into the
+            // graph, causing replay to access invalid memory.
+            (C10_LIKELY(!is_capture_context()) &&
+             (try_mempool_fallback(params, size, &queue, device, alloc_size) ||
+              (release_cached_blocks(context, {0, 0}) &&
+               alloc_block(params, true, context))));
+      }
     }
     if (!block_found) {
       const auto& raw_device = c10::xpu::get_raw_device(device);
